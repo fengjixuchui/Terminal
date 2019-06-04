@@ -6,9 +6,13 @@
 #include <shellapi.h>
 #include <filesystem>
 #include <winrt/Microsoft.UI.Xaml.XamlTypeInfo.h>
+#include <winrt/Windows.ApplicationModel.Resources.h>
+
+#include "App.g.cpp"
 
 using namespace winrt::Windows::ApplicationModel::DataTransfer;
 using namespace winrt::Windows::UI::Xaml;
+using namespace winrt::Windows::UI::Text;
 using namespace winrt::Windows::UI::Core;
 using namespace winrt::Windows::System;
 using namespace winrt::Microsoft::Terminal;
@@ -42,7 +46,9 @@ namespace winrt::TerminalApp::implementation
         base_type(parentProvider),
         _settings{  },
         _tabs{  },
-        _loadedInitialSettings{ false }
+        _loadedInitialSettings{ false },
+        _settingsLoadedResult{ S_OK },
+        _dialogLock{}
     {
         // For your own sanity, it's better to do setup outside the ctor.
         // If you do any setup in the ctor that ends up throwing an exception,
@@ -159,6 +165,7 @@ namespace winrt::TerminalApp::implementation
         {
             IInspectable g = res.Lookup(key);
             winrt::Windows::UI::Xaml::Style style = g.try_as<winrt::Windows::UI::Xaml::Style>();
+            _root.Style(style);
             _tabRow.Style(style);
         }
 
@@ -166,6 +173,68 @@ namespace winrt::TerminalApp::implementation
         _ApplyTheme(_settings->GlobalSettings().GetRequestedTheme());
 
         _OpenNewTab(std::nullopt);
+
+        _root.Loaded({ this, &App::_OnLoaded });
+    }
+
+    // Method Description:
+    // - Show a ContentDialog with a single "Ok" button to dismiss. Looks up the
+    //   the title and text from our Resources using the provided keys.
+    // - Only one dialog can be visible at a time. If another dialog is visible
+    //   when this is called, nothing happens.
+    // Arguments:
+    // - titleKey: The key to use to lookup the title text from our resources.
+    // - contentKey: The key to use to lookup the content text from our resources.
+    fire_and_forget App::_ShowOkDialog(const winrt::hstring& titleKey,
+                                       const winrt::hstring& contentKey)
+    {
+        // DON'T release this lock in a wil::scope_exit. The scope_exit will get
+        // called when we await, which is not what we want.
+        std::unique_lock lock{ _dialogLock, std::try_to_lock };
+        if (!lock)
+        {
+            // Another dialog is visible.
+            return;
+        }
+
+        auto resourceLoader = Windows::ApplicationModel::Resources::ResourceLoader::GetForCurrentView();
+        auto title = resourceLoader.GetString(titleKey);
+        auto message = resourceLoader.GetString(contentKey);
+        auto buttonText = resourceLoader.GetString(L"Ok");
+
+        Controls::ContentDialog dialog;
+        dialog.Title(winrt::box_value(title));
+        dialog.Content(winrt::box_value(message));
+        dialog.CloseButtonText(buttonText);
+
+        // IMPORTANT: Add the dialog to the _root UIElement before you show it,
+        // so it knows how to attach to the XAML content.
+        _root.Children().Append(dialog);
+
+        // Display the dialog.
+        Controls::ContentDialogResult result = co_await dialog.ShowAsync(Controls::ContentDialogPlacement::Popup);
+
+        // After the dialog is dismissed, the dialog lock (held by `lock`) will
+        // be released so another can be shown.
+    }
+
+    // Method Description:
+    // - Triggered when the application is fiished loading. If we failed to load
+    //   the settings, then this will display the error dialog. This is done
+    //   here instead of when loading the settings, because we need our UI to be
+    //   visible to display the dialog, and when we're loading the settings,
+    //   the UI might not be visible yet.
+    // Arguments:
+    // - <unused>
+    void App::_OnLoaded(const IInspectable& /*sender*/,
+                        const RoutedEventArgs& /*eventArgs*/)
+    {
+        if (FAILED(_settingsLoadedResult))
+        {
+            const winrt::hstring titleKey = L"InitialJsonParseErrorTitle";
+            const winrt::hstring textKey = L"InitialJsonParseErrorText";
+            _ShowOkDialog(titleKey, textKey);
+        }
     }
 
     // Method Description:
@@ -215,10 +284,26 @@ namespace winrt::TerminalApp::implementation
     void App::_CreateNewTabFlyout()
     {
         auto newTabFlyout = Controls::MenuFlyout{};
+        auto keyBindings = _settings->GetKeybindings();
+
+        const GUID defaultProfileGuid = _settings->GlobalSettings().GetDefaultProfile();
         for (int profileIndex = 0; profileIndex < _settings->GetProfiles().size(); profileIndex++)
         {
             const auto& profile = _settings->GetProfiles()[profileIndex];
             auto profileMenuItem = Controls::MenuFlyoutItem{};
+
+            // add the keyboard shortcuts for the first 9 profiles
+            if (profileIndex < 9)
+            {
+                // enum value for ShortcutAction::NewTabProfileX; 0==NewTabProfile0
+                auto profileKeyChord = keyBindings.GetKeyBinding(static_cast<ShortcutAction>(profileIndex + static_cast<int>(ShortcutAction::NewTabProfile0)));
+
+                // make sure we find one to display
+                if (profileKeyChord)
+                {
+                    _SetAcceleratorForMenuItem(profileMenuItem, profileKeyChord);
+                }
+            }
 
             auto profileName = profile.GetName();
             winrt::hstring hName{ profileName };
@@ -229,6 +314,12 @@ namespace winrt::TerminalApp::implementation
             if (profile.HasIcon())
             {
                 profileMenuItem.Icon(_GetIconFromProfile(profile));
+            }
+
+            if (profile.GetGuid() == defaultProfileGuid)
+            {
+                // Contrast the default profile with others in font weight.
+                profileMenuItem.FontWeight(FontWeights::Bold());
             }
 
             profileMenuItem.Click([this, profileIndex](auto&&, auto&&){
@@ -253,6 +344,12 @@ namespace winrt::TerminalApp::implementation
 
             settingsItem.Click({ this, &App::_SettingsButtonOnClick });
             newTabFlyout.Items().Append(settingsItem);
+
+            auto settingsKeyChord = keyBindings.GetKeyBinding(ShortcutAction::OpenSettings);
+            if (settingsKeyChord)
+            {
+                _SetAcceleratorForMenuItem(settingsItem, settingsKeyChord);
+            }
 
             // Create the feedback button.
             auto feedbackFlyout = Controls::MenuFlyoutItem{};
@@ -300,14 +397,12 @@ namespace winrt::TerminalApp::implementation
     }
 
     // Method Description:
-    // - Called when the feedback button is clicked. Launches the feedback hub
-    //   to the list of all feedback for the Terminal app.
+    // - Called when the feedback button is clicked. Launches github in your
+    //   default browser, navigated to the "issues" page of the Terminal repo.
     void App::_FeedbackButtonOnClick(const IInspectable&,
                                      const RoutedEventArgs&)
     {
-        // If you want this to go to the new feedback page automatically, use &newFeedback=true
-        winrt::Windows::System::Launcher::LaunchUriAsync({ L"feedback-hub://?tabid=2&appid=Microsoft.WindowsTerminal_8wekyb3d8bbwe!App" });
-
+        winrt::Windows::System::Launcher::LaunchUriAsync({ L"https://github.com/microsoft/Terminal/issues" });
     }
 
     // Method Description:
@@ -325,10 +420,46 @@ namespace winrt::TerminalApp::implementation
         bindings.NewTab([this]() { _OpenNewTab(std::nullopt); });
         bindings.CloseTab([this]() { _CloseFocusedTab(); });
         bindings.NewTabWithProfile([this](const auto index) { _OpenNewTab({ index }); });
-        bindings.ScrollUp([this]() { _DoScroll(-1); });
-        bindings.ScrollDown([this]() { _DoScroll(1); });
+        bindings.ScrollUp([this]() { _Scroll(-1); });
+        bindings.ScrollDown([this]() { _Scroll(1); });
         bindings.NextTab([this]() { _SelectNextTab(true); });
         bindings.PrevTab([this]() { _SelectNextTab(false); });
+        bindings.ScrollUpPage([this]() { _ScrollPage(-1); });
+        bindings.ScrollDownPage([this]() { _ScrollPage(1); });
+        bindings.SwitchToTab([this](const auto index) { _SelectTab({ index }); });
+        bindings.OpenSettings([this]() { _OpenSettings(); });
+    }
+
+    // Method Description:
+    // - Attempt to load the settings. If we fail for any reason, returns an error.
+    // Arguments:
+    // - saveOnLoad: If true, after loading the settings, we should re-write
+    //   them to the file, to make sure the schema is updated. See
+    //   `CascadiaSettings::LoadAll` for details.
+    // Return Value:
+    // - S_OK if we successfully parsed the settings, otherwise an appropriate HRESULT.
+    [[nodiscard]]
+    HRESULT App::_TryLoadSettings(const bool saveOnLoad) noexcept
+    {
+        HRESULT hr = E_FAIL;
+
+        try
+        {
+            auto newSettings = CascadiaSettings::LoadAll(saveOnLoad);
+            _settings = std::move(newSettings);
+            hr = S_OK;
+        }
+        catch (const winrt::hresult_error& e)
+        {
+            hr = e.code();
+            LOG_HR(hr);
+        }
+        catch (...)
+        {
+            hr = wil::ResultFromCaughtException();
+            LOG_HR(hr);
+        }
+        return hr;
     }
 
     // Method Description:
@@ -340,7 +471,21 @@ namespace winrt::TerminalApp::implementation
     //      happening during startup, it'll need to happen on a background thread.
     void App::LoadSettings()
     {
-        _settings = CascadiaSettings::LoadAll();
+        // Attempt to load the settings.
+        // If it fails,
+        //  - use Default settings,
+        //  - don't persist them (LoadAll won't save them in this case).
+        //  - _settingsLoadedResult will be set to an error, indicating that
+        //    we should display the loading error.
+        //    * We can't display the error now, because we might not have a
+        //      UI yet. We'll display the error in _OnLoaded.
+        _settingsLoadedResult = _TryLoadSettings(true);
+
+        if (FAILED(_settingsLoadedResult))
+        {
+            _settings = std::make_unique<CascadiaSettings>();
+            _settings->CreateDefaults();
+        }
 
         _HookupKeyBindings(_settings->GetKeybindings());
 
@@ -371,7 +516,7 @@ namespace winrt::TerminalApp::implementation
             [this](wil::FolderChangeEvent event, PCWSTR fileModified)
         {
             // We want file modifications, AND when files are renamed to be
-            // profiles.json. This second case will ofentimes happen with text
+            // profiles.json. This second case will oftentimes happen with text
             // editors, who will write a temp file, then rename it to be the
             // actual file you wrote. So listen for that too.
             if (!(event == wil::FolderChangeEvent::Modified ||
@@ -397,19 +542,36 @@ namespace winrt::TerminalApp::implementation
 
     // Method Description:
     // - Reloads the settings from the profile.json.
-    // Arguments:
-    // - <none>
-    // Return Value:
-    // - <none>
     void App::_ReloadSettings()
     {
-        _settings = CascadiaSettings::LoadAll();
+        // Attempt to load our settings.
+        // If it fails,
+        //  - don't change the settings (and don't actually apply the new settings)
+        //  - don't persist them.
+        //  - display a loading error
+        _settingsLoadedResult = _TryLoadSettings(false);
+
+        if (FAILED(_settingsLoadedResult))
+        {
+            _root.Dispatcher().RunAsync(CoreDispatcherPriority::Normal, [this]() {
+                const winrt::hstring titleKey = L"ReloadJsonParseErrorTitle";
+                const winrt::hstring textKey = L"ReloadJsonParseErrorText";
+                _ShowOkDialog(titleKey, textKey);
+            });
+
+            return;
+        }
+
+        // Here, we successfully reloaded the settings, and created a new
+        // TerminalSettings object.
+
         // Re-wire the keybindings to their handlers, as we'll have created a
         // new AppKeyBindings object.
         _HookupKeyBindings(_settings->GetKeybindings());
 
-        auto profiles = _settings->GetProfiles();
+        // Refresh UI elements
 
+        auto profiles = _settings->GetProfiles();
         for (auto &profile : profiles)
         {
             const GUID profileGuid = profile.GetGuid();
@@ -629,8 +791,7 @@ namespace winrt::TerminalApp::implementation
                 // reloading settings)
                 const auto* const p = _settings->FindProfile(tabProfile);
 
-                // TODO: MSFT:21268795: Need a better story for what should happen when the last tab is closed.
-                if (p != nullptr && p->GetCloseOnExit() && _tabs.size() > 1)
+                if (p != nullptr && p->GetCloseOnExit())
                 {
                     _RemoveTabViewItem(tabViewItem);
                 }
@@ -657,21 +818,18 @@ namespace winrt::TerminalApp::implementation
         return _tabView.SelectedIndex();
     }
 
+    void App::_OpenSettings()
+    {
+        LaunchSettings();
+    }
+
     // Method Description:
     // - Close the currently focused tab. Focus will move to the left, if possible.
     void App::_CloseFocusedTab()
     {
-        if (_tabs.size() > 1)
-        {
-            int focusedTabIndex = _GetFocusedTabIndex();
-            std::shared_ptr<Tab> focusedTab{ _tabs[focusedTabIndex] };
-
-            // We're not calling _FocusTab here because it makes an async dispatch
-            // that is practically guaranteed to not happen before we delete the tab.
-            _tabView.SelectedIndex((focusedTabIndex > 0) ? focusedTabIndex - 1 : 1);
-            _tabView.Items().RemoveAt(focusedTabIndex);
-            _tabs.erase(_tabs.begin() + focusedTabIndex);
-        }
+        int focusedTabIndex = _GetFocusedTabIndex();
+        std::shared_ptr<Tab> focusedTab{ _tabs[focusedTabIndex] };
+        _RemoveTabViewItem(focusedTab->GetTabViewItem());
     }
 
     // Method Description:
@@ -680,10 +838,27 @@ namespace winrt::TerminalApp::implementation
     //      view up, and positive values will move the viewport down.
     // Arguments:
     // - delta: a number of lines to move the viewport relative to the current viewport.
-    void App::_DoScroll(int delta)
+    void App::_Scroll(int delta)
     {
         int focusedTabIndex = _GetFocusedTabIndex();
         _tabs[focusedTabIndex]->Scroll(delta);
+    }
+
+    // Method Description:
+    // - Move the viewport of the terminal of the currently focused tab up or
+    //      down a page. The page length will be dependent on the terminal view height.
+    //      Negative values of `delta` will move the view up by one page, and positive values
+    //      will move the viewport down by one page.
+    // Arguments:
+    // - delta: The direction to move the view relative to the current viewport(it
+    //      is clamped between -1 and 1)
+    void App::_ScrollPage(int delta)
+    {
+        delta = std::clamp(delta, -1, 1);
+        const auto focusedTabIndex = _GetFocusedTabIndex();
+        const auto control = _tabs[focusedTabIndex]->GetTerminalControl();
+        const auto termHeight = control.GetViewHeight();
+        _tabs[focusedTabIndex]->Scroll(termHeight * delta);
     }
 
     // Method Description:
@@ -710,8 +885,18 @@ namespace winrt::TerminalApp::implementation
         // we clamp the values to the range [0, tabCount) while still supporting moving
         // leftward from 0 to tabCount - 1.
         _SetFocusedTabIndex(
-            (tabCount + focusedTabIndex + (bMoveRight ? 1 : -1)) % tabCount
+            static_cast<int>((tabCount + focusedTabIndex + (bMoveRight ? 1 : -1)) % tabCount)
         );
+    }
+
+    // Method Description:
+    // - Sets focus to the desired tab.
+    void App::_SelectTab(const int tabIndex)
+    {
+        if (tabIndex >= 0 && tabIndex < _tabs.size())
+        {
+            _SetFocusedTabIndex(tabIndex);
+        }
     }
 
     // Method Description:
@@ -758,13 +943,9 @@ namespace winrt::TerminalApp::implementation
     // - eventArgs: the event's constituent arguments
     void App::_OnTabClosing(const IInspectable& sender, const MUX::Controls::TabViewTabClosingEventArgs& eventArgs)
     {
-        // Don't allow the user to close the last tab ..
-        // .. yet.
-        if (_tabs.size() > 1)
-        {
-            const auto tabViewItem = eventArgs.Item();
-            _RemoveTabViewItem(tabViewItem);
-        }
+        const auto tabViewItem = eventArgs.Item();
+        _RemoveTabViewItem(tabViewItem);
+
         // If we don't cancel the event, the TabView will remove the item itself.
         eventArgs.Cancel(true);
     }
@@ -825,17 +1006,33 @@ namespace winrt::TerminalApp::implementation
     // - tabViewItem: the TabViewItem in the TabView that is being removed.
     void App::_RemoveTabViewItem(const IInspectable& tabViewItem)
     {
+        // To close the window here, we need to close the hosting window.
+        if (_tabs.size() == 1)
+        {
+            _lastTabClosedHandlers();
+        }
         uint32_t tabIndexFromControl = 0;
         _tabView.Items().IndexOf(tabViewItem, tabIndexFromControl);
-
-        if (tabIndexFromControl == _GetFocusedTabIndex())
-        {
-            _tabView.SelectedIndex((tabIndexFromControl > 0) ? tabIndexFromControl - 1 : 1);
-        }
+        auto focusedTabIndex = _GetFocusedTabIndex();
 
         // Removing the tab from the collection will destroy its control and disconnect its connection.
         _tabs.erase(_tabs.begin() + tabIndexFromControl);
         _tabView.Items().RemoveAt(tabIndexFromControl);
+
+        if (tabIndexFromControl == focusedTabIndex)
+        {
+            if (focusedTabIndex >= _tabs.size())
+            {
+                focusedTabIndex = _tabs.size() - 1;
+            }
+
+            if (focusedTabIndex < 0)
+            {
+                focusedTabIndex = 0;
+            }
+
+            _SelectTab(focusedTabIndex);
+        }
     }
 
     // Method Description:
@@ -870,8 +1067,43 @@ namespace winrt::TerminalApp::implementation
         }
     }
 
+
+    // Method Description:
+    // - Takes a MenuFlyoutItem and a corresponding KeyChord value and creates the accelerator for UI display.
+    //   Takes into account a special case for an error condition for a comma
+    // Arguments:
+    // - MenuFlyoutItem that will be displayed, and a KeyChord to map an accelerator
+    void App::_SetAcceleratorForMenuItem(Windows::UI::Xaml::Controls::MenuFlyoutItem& menuItem, const winrt::Microsoft::Terminal::Settings::KeyChord& keyChord)
+    {
+        // work around https://github.com/microsoft/microsoft-ui-xaml/issues/708 in case of VK_OEM_COMMA
+        if (keyChord.Vkey() != VK_OEM_COMMA)
+        {
+            // use the XAML shortcut to give us the automatic capabilities
+            auto menuShortcut = Windows::UI::Xaml::Input::KeyboardAccelerator{};
+
+            // TODO: Modify this when https://github.com/microsoft/terminal/issues/877 is resolved
+            menuShortcut.Key(static_cast<Windows::System::VirtualKey>(keyChord.Vkey()));
+
+            // inspect the modifiers from the KeyChord and set the flags int he XAML value
+            auto modifiers = AppKeyBindings::ConvertVKModifiers(keyChord.Modifiers());
+
+            // add the modifiers to the shortcut
+            menuShortcut.Modifiers(modifiers);
+
+            // add to the menu
+            menuItem.KeyboardAccelerators().Append(menuShortcut);
+        }
+        else // we've got a comma, so need to just use the alternate method
+        {
+            // extract the modifier and key to a nice format
+            auto overrideString = AppKeyBindings::FormatOverrideShortcutText(keyChord.Modifiers());
+            menuItem.KeyboardAcceleratorTextOverride(overrideString + L" ,");
+        }
+    }
+
     // -------------------------------- WinRT Events ---------------------------------
     // Winrt events need a method for adding a callback to the event and removing the callback.
     // These macros will define them both for you.
     DEFINE_EVENT(App, TitleChanged, _titleChangeHandlers, TerminalControl::TitleChangedEventArgs);
+    DEFINE_EVENT(App, LastTabClosed, _lastTabClosedHandlers, winrt::TerminalApp::LastTabClosedEventArgs);
 }
